@@ -125,9 +125,9 @@ class RiotApi:
         df_result.set_index('account_id', inplace=True)
         df_result['revision_date'] = pd.to_datetime(df_result['revision_date'], unit='ms')
         return df_result
-    def get_match_list(self, account_id: str, begin_time: str = '0', end_index: int=0) -> pd.DataFrame:
+    def get_match_list(self, account_id: str, end_index: int=0) -> pd.DataFrame:
         try:
-            result = self.__post_query('https://euw1.api.riotgames.com/lol/match/v4/matchlists/by-account/'+account_id+'?beginTime='+begin_time+'&endIndex='+str(end_index))['matches']
+            result = self.__post_query('https://euw1.api.riotgames.com/lol/match/v4/matchlists/by-account/'+account_id+'?endIndex='+str(end_index))['matches']
             df_matches = pd.json_normalize(result)
             df_matches.columns = map(self.__snake_case, df_matches.columns)
             return df_matches
@@ -170,7 +170,7 @@ class RiotApi:
         participants.columns = map(lambda x: re.sub('player.', '', x), participants.columns)
         participants.columns = map(self.__snake_case, participants.columns)
         participants = participants.set_index(['game_id', 'participant_id'])
-        participants['summoner_name'] = participants['summoner_name'].apply(lambda val: unicodedata.normalize('NFKD', val).encode('ascii', 'ignore').decode())
+        #participants['summoner_name'] = participants['summoner_name'].apply(lambda val: unicodedata.normalize('NFKD', val).encode('ascii', 'ignore').decode())
         return {'participants': participants}
     def __extract_stats_data(self, data: json) -> Dict[str, pd.DataFrame]:
         stats = pd.json_normalize(data, record_path=['participants'], meta=['gameId'])
@@ -200,26 +200,21 @@ class Controller:
         summoner = self.api.get_summoner_by_name(summoner_name)
         if summoner.shape[0] == 0:
             raise Exception('no summoner with name {0} found'.format(summoner_name))
+        
+        self.engine.merge_table('summoner', summoner)
 
-        #Get timestamp last update
-        stmt = text("select * from summoner where account_id = :p_acc_id")
-        stmt = stmt.bindparams(p_acc_id=summoner.index[0])
-        r = self.engine.execute(stmt).fetchall()
-        if len(r) == 0:
-            # First time searched for summoner
-            self.engine.merge_table('summoner', summoner)
-            last_update = '0'
-        elif r[0][7] == None:
-            last_update = '0'
-        else:
-            # Use last_update from database
-            last_update = r[0][7] + pd.DateOffset(hours=-2)
-            last_update = str(int(last_update.timestamp()*1000))
-
-        matches = self.api.get_match_list(summoner.index[0], begin_time=last_update, end_index=end_index)
+        matches = self.api.get_match_list(summoner.index[0], end_index=end_index)
         amount_of_matches = matches.shape[0]
-        logging.debug('Fetched %s matches', amount_of_matches)
 
+        # get only new matches
+        stmt = text("select game_id from matches where game_id in :p_matches")
+        stmt = stmt.bindparams(p_matches=tuple([str(x) for x in matches.game_id]))
+        matches_already_loaded = self.engine.execute(stmt)
+        matches_already_loaded = pd.DataFrame(matches_already_loaded.fetchall(), columns=matches_already_loaded.keys())
+        new_matches = matches[~matches.game_id.isin(matches_already_loaded.game_id)]
+
+        logging.debug('%s out of %s fetched matches are not in database', new_matches.shape[0], amount_of_matches)
+        
         #update last_update
         stmt = text("update summoner set last_update = :p_last_update where account_id = :p_acc_id")
         stmt = stmt.bindparams(p_last_update=pd.Timestamp.now(), p_acc_id=summoner.index[0])
@@ -228,7 +223,7 @@ class Controller:
         if amount_of_matches == 0:
             return
 
-        for m in matches.game_id:
+        for m in new_matches.game_id:
             details = self.api.get_match_details(str(m))
             for name, table in details.items():
                 self.engine.merge_table(name, table)

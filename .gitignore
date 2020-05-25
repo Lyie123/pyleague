@@ -1,0 +1,9 @@
+anywhere/
+.vscode/
+data/
+.swp
+champion.json
+*.log
+_pycache_/
+lol.py
+playground/
