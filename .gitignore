@@ -7,3 +7,5 @@ champion.json
 _pycache_/
 lol.py
 playground/
+__pycache__/
+main.py
