@@ -15,8 +15,6 @@ from enum import Enum
 
 logging.basicConfig(filename='league_api.log', level=logging.DEBUG, format='%(asctime)s %(message)s', datefmt='%d.%m.%Y %H:%M:%S')
 
-#digital ocean: Qde7FcK53t2Z6LY
-
 class QueueType(Enum):
     RANKED_SOLO = 'RANKED_SOLO_5x5'
     RANKED_FLEX = 'RANKED_FLEX_SR'
