@@ -72,22 +72,6 @@ class SqlEngine:
     def read_table(self, table_name: str):
         return pd.read_sql_table(table_name, self.engine)
 
-class StaticContent:
-    @staticmethod
-    def load_champion_json(engine: SqlEngine) -> None:
-        f = open('/home/lyie/Desktop/projects/pyleague/data/9.3.1/data/en_US/champion.json')
-        content = json.loads(f.read())
-        table = pd.DataFrame()
-        for key, value in content['data'].items():
-            table = table.append(pd.json_normalize(value), ignore_index=True)
-        table.columns = list(map(lambda x: re.sub('\.', '_', x), table.columns))
-        table.rename(columns={'key': 'champion_id'}, inplace=True)
-        table.drop(columns=['id'], inplace=True)
-        table.set_index('champion_id', inplace=True)
-        table['tags'] = table.tags.apply(lambda x: ', '.join(x))
-
-        engine.create_table('champions', table)
-
 class RiotApi:
     def __init__(self, api_key: str) -> None:
         self.key = api_key
@@ -139,14 +123,20 @@ class RiotApi:
         df_result['revision_date'] = pd.to_datetime(df_result['revision_date'], unit='ms')
         return df_result
 
-    def get_match_list(self, account_id: str, end_index: int=100, champion_id: int=-1) -> pd.DataFrame:
+    def get_match_list(self, account_id: str, end_index: int=100, start_index: int=0, queue_id: int=-1, champion_id: int=-1, full: bool=False) -> pd.DataFrame:
         try:
-            query = 'https://euw1.api.riotgames.com/lol/match/v4/matchlists/by-account/'+account_id+'?endIndex='+str(end_index)
+            query = 'https://euw1.api.riotgames.com/lol/match/v4/matchlists/by-account/'+account_id+'?beginIndex='+str(start_index)+'&endIndex='+str(end_index)
             if champion_id != -1:
                 query += '&champion='+str(champion_id)
+            if queue_id != -1:
+                query += '&queue='+str(queue_id)
             result = self.__post_query(query)['matches']
             df_matches = pd.json_normalize(result)
             df_matches.columns = map(self.__snake_case, df_matches.columns)
+
+            if full and len(df_matches) > 0:
+                df_matches = pd.concat([df_matches, self.get_match_list(account_id, start_index=end_index, end_index=end_index+100, queue_id=queue_id, champion_id=champion_id, full=full)])
+
             return df_matches
         except NoResultFound:
             return pd.DataFrame()
@@ -159,6 +149,35 @@ class RiotApi:
         frames.update(self.__extract_bans_data(result))
         frames.update(self.__extract_participants_data(result))
         frames.update(self.__extract_stats_data(result))
+        return frames
+
+    def get_timeline(self, match_id: str) -> Dict[str, pd.DataFrame]:
+        query = 'https://euw1.api.riotgames.com/lol/match/v4/timelines/by-match/'+str(match_id)
+        result = self.__post_query(query)
+
+        df_participants = pd.DataFrame()
+        df_events = pd.DataFrame()
+        for frame in result['frames']:
+            for participant in frame['participantFrames'].values():
+                buffer = pd.json_normalize(participant, sep='_')
+                buffer['timestamp'] = frame['timestamp']
+                df_participants = df_participants.append(buffer, ignore_index=True)
+            for event in frame['events']:
+                buffer = pd.json_normalize(event, sep='_')
+                df_events = df_events.append(buffer, ignore_index=True)
+
+        df_participants.columns = map(self.__snake_case, df_participants.columns)
+        df_participants['game_id'] = str(match_id)
+        df_participants = df_participants.set_index(['game_id', 'timestamp', 'participant_id'])
+
+        df_events.columns =  map(self.__snake_case, df_events.columns)
+        df_events['game_id'] = str(match_id)
+        df_events = df_events.set_index(['game_id', 'timestamp', 'participant_id', 'type'])
+        
+        frames = {}
+        frames.update({'participants': df_participants})
+        frames.update({'events': df_events})
+
         return frames
 
     def get_leaderboard(self, queue_type: QueueType) -> pd.DataFrame:
@@ -211,6 +230,25 @@ class RiotApi:
         stats.columns = map(self.__snake_case, stats.columns)
         stats = stats.set_index(['game_id', 'team_id', 'participant_id'])
         return {'stats': stats}
+    
+    def get_queue_types(self) -> pd.DataFrame:
+        df_result = pd.read_json('http://static.developer.riotgames.com/docs/lol/queues.json')
+        df_result.columns = map(self.__snake_case, df_result.columns)
+        df_result = df_result.set_index('queue_id')
+        return df_result
+
+    def get_champion_json(self) -> pd.DataFrame:
+        content = requests.get('http://ddragon.leagueoflegends.com/cdn/10.22.1/data/en_US/champion.json').json()
+        table = pd.DataFrame()
+        for value in content['data'].values():
+            table = table.append(pd.json_normalize(value), ignore_index=True)
+        table.columns = map(self.__snake_case, table)
+        table.rename(columns={'key': 'champion_id'}, inplace=True)
+        table.drop(columns=['id'], inplace=True)
+        table.set_index('champion_id', inplace=True)
+        table['tags'] = table.tags.apply(lambda x: ', '.join(x))
+        return table
+
 
 class Controller:
     def __init__(self, api_key: str, connection_string: str):
