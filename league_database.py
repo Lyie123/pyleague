@@ -3,10 +3,21 @@ import league_api as api
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import sessionmaker, relationship
 
 Base = declarative_base()
+
+class Summoner(Base):
+    __tablename__ = 'summoner'
+
+    account_id = Column(String, primary_key=True)
+
+    summoner_id = Column(String)
+    puuid = Column(String)
+    summoner_name = Column(String)
+    profile_icon_id = Column(Integer)
+    revision_date = Column(DateTime)
+    summoner_level = Column(Integer)
 
 class Match(Base):
     __tablename__ = 'matches'
@@ -22,8 +33,6 @@ class Match(Base):
     game_version = Column(String)
     game_mode = Column(String)
     game_type = Column(String)
-
-
 
 class Team(Base):
     __tablename__ = 'teams'
@@ -46,7 +55,6 @@ class Team(Base):
     rift_herald_kills = Column(Integer)
     dominion_victory_score = Column(Integer)
 
-
 class Ban(Base):
     __tablename__ = 'bans'
 
@@ -55,7 +63,7 @@ class Ban(Base):
     pick_turn = Column(Integer, primary_key=True)
     champion_id = Column(Integer, primary_key=True)
 
-class Participant:
+class Participant(Base):
     __tablename__ = 'participants'
 
     game_id = Column(String, ForeignKey('matches.game_id'), primary_key=True)
@@ -186,8 +194,19 @@ class Stats(Base):
     role = Column(String)
     lane = Column(String)
 
+class LeagueDB:
+    def __init__(self, con: str):
+        self.engine = create_engine(con, echo=True)
+        self.Session = sessionmaker(bind=self.engine)
 
+    def create_db_layout(self):
+        Base.metadata.create_all(self.engine)
 
-def create_db_layout(connection_string: str):
-    engine = create_engine(connection_string, echo=True)
-    Base.metadata.create_all(engine)
+    def update_summoner(self, summoner_name: str, number_of_games: int, champion_id: int, season_id: str):
+        session = self.Session()
+        summoner = pd.read_sql(session.query(Summoner).filter_by(summoner_name=summoner_name), session)
+        print(summoner)
+        
+
+    def update_static_data(self):
+        pass
