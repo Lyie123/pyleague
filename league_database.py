@@ -1,9 +1,18 @@
+from datetime import datetime
 import pandas as pd
+from sqlalchemy.orm.exc import NoResultFound
 import league_api as api
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey
 from sqlalchemy.orm import sessionmaker, relationship
+from psycopg2.extensions import register_adapter, AsIs
+from numpy import int64
+
+
+# conversation numpy.int64 to int
+register_adapter(int64, AsIs)
 
 Base = declarative_base()
 
@@ -37,7 +46,7 @@ class Match(Base):
 class Team(Base):
     __tablename__ = 'teams'
 
-    game_id = Column(String, ForeignKey('matches.game_id'), primary_key=True)
+    game_id = Column(String, ForeignKey('matches.game_id', ondelete='CASCADE'), primary_key=True)
     team_id = Column(String, primary_key=True)
 
     win = Column(String)
@@ -58,7 +67,7 @@ class Team(Base):
 class Ban(Base):
     __tablename__ = 'bans'
 
-    game_id = Column(String, ForeignKey('matches.game_id'), primary_key=True)
+    game_id = Column(String, ForeignKey('matches.game_id', ondelete='CASCADE'), primary_key=True)
     team_id = Column(String, primary_key=True)
     pick_turn = Column(Integer, primary_key=True)
     champion_id = Column(Integer, primary_key=True)
@@ -66,7 +75,7 @@ class Ban(Base):
 class Participant(Base):
     __tablename__ = 'participants'
 
-    game_id = Column(String, ForeignKey('matches.game_id'), primary_key=True)
+    game_id = Column(String, ForeignKey('matches.game_id', ondelete='CASCADE'), primary_key=True)
     participant_id = Column(String, primary_key=True)
 
     platform_id = Column(String)
@@ -74,14 +83,14 @@ class Participant(Base):
     summoner_name = Column(String)
     summoner_id = Column(String)
     current_platform_id = Column(String)
-    current_accout_id = Column(String)
+    current_account_id = Column(String)
     match_history_uri = Column(String)
     profile_icon = Column(Integer)
 
 class Stats(Base):
     __tablename__ = 'stats'
 
-    game_id = Column(String, ForeignKey('matches.game_id'), primary_key=True)
+    game_id = Column(String, ForeignKey('matches.game_id', ondelete='CASCADE'), primary_key=True)
     team_id = Column(String, primary_key=True)
     participant_id = Column(String, primary_key=True)
     
@@ -194,19 +203,138 @@ class Stats(Base):
     role = Column(String)
     lane = Column(String)
 
-class LeagueDB:
-    def __init__(self, con: str):
-        self.engine = create_engine(con, echo=True)
-        self.Session = sessionmaker(bind=self.engine)
+class TimelineParticipant(Base):
+    __tablename__ = 'timeline_participants'
 
-    def create_db_layout(self):
+    game_id = Column(String, ForeignKey('matches.game_id', ondelete='CASCADE'), primary_key=True)
+    timestamp = Column(Integer, primary_key=True)
+    participant_id = Column(String, primary_key=True)
+
+    current_gold = Column(Integer)
+    total_gold = Column(Integer)
+    level = Column(Integer)
+    xp = Column(Integer)
+    minions_killed = Column(Integer)
+    jungle_minions_killed = Column(Integer)
+    dominion_score = Column(Integer)
+    team_score = Column(Integer)
+    position_x = Column(Integer)
+    position_y = Column(Integer)
+
+class TimelineEvents(Base):
+    __tablename__ = 'timeline_events'
+
+    game_id = Column(String, ForeignKey('matches.game_id', ondelete='CASCADE'), primary_key=True)
+    timestamp = Column(Integer, primary_key=True)
+    participant_id = Column(String, primary_key=True)
+    type = Column(String, primary_key=True)
+    sequence = Column(Integer, primary_key=True)
+
+    skill_slot = Column(String)
+    level_up_type = Column(String)
+    item_id = Column(String)
+    ward_type = Column(String)
+    creator_id = Column(String)
+    killer_id = Column(String)
+    victim_id = Column(String)
+    assisting_participant_ids = Column(String)
+    position_x = Column(String)
+    position_y = Column(String)
+    monster_type = Column(String)
+    after_id = Column(String)
+    before_id = Column(String)
+    team_id = Column(String)
+    building_type = Column(String)
+    lane_type = Column(String)
+    tower_type = Column(String)
+    monster_sub_type = Column(String)
+
+class LeagueDB:
+    def __init__(self, con: str, api_key: str):
+        self.engine = create_engine(con)
+        self.Session = sessionmaker(bind=self.engine)
+        self.api = api.RiotApi(api_key)
+
+    def create_db_layout(self) -> None:
         Base.metadata.create_all(self.engine)
 
-    def update_summoner(self, summoner_name: str, number_of_games: int, champion_id: int, season_id: str):
+    def update_summoner(self, summoner_name: str, number_of_games: int=100, champion_id: int=-1, season_id: str=-1, patch: str=-1, begin_time: datetime=None, queue_id: int=-1) -> None:
+        api.logging.info('update summoner: {0}'.format(summoner_name))
         session = self.Session()
-        summoner = pd.read_sql(session.query(Summoner).filter_by(summoner_name=summoner_name), session)
-        print(summoner)
-        
+        try:
+            df_summoner = self.api.get_summoner_by_name(summoner_name)
+            if df_summoner.empty:
+                api.logging.info('summoner with name {0} not found'.format(summoner_name))
+                return
+            
+            summoner = Summoner(**df_summoner.reset_index().iloc[0])
+            session.merge(summoner)
+            session.commit()
 
-    def update_static_data(self):
-        pass
+            try:
+                matches = self.api.get_match_list(summoner.account_id, champion_id=champion_id, end_index=number_of_games, begin_time=begin_time, queue_id=queue_id)
+                if matches.empty:
+                    api.logging.info('no new matches for summoner {0}'.format(summoner_name))
+                    return
+
+                query = session.query(Match).filter(Match.game_id.in_([str(n) for n in matches.game_id.values])) 
+                matches_already_loaded = pd.read_sql(sql=query.statement, con=session.bind)
+                if matches_already_loaded.empty:
+                    new_matches = matches.game_id.values
+                else:
+                    new_matches = matches[~matches.game_id.isin(matches_already_loaded.game_id)].game_id.values
+
+                api.logging.info('{0} out of {1} are new matches'.format(len(new_matches), len(matches)))
+                for match in new_matches:
+                    try:
+                        details = self.api.get_match_details(match)
+                        for name, table in details.items():
+                            try:
+                                table.to_sql(name=name, con=session.bind, if_exists='append')
+                            except IntegrityError:
+                                pass
+                        
+                        timeline = self.api.get_timeline(match)
+                        for name, table in timeline.items():
+                            table.to_sql(name=name, con=session.bind, if_exists='append')
+                        
+                        api.logging.info('Merged {0} successfully'.format(match))
+                    except Exception as e:
+                        api.logging.error('error while gathering match details for game_id {0}'.format(match))
+                        api.logging.error(str(e))
+                        pass
+            except NoResultFound as e:
+                api.logging.info('no new matches for summoner {0}'.format(summoner_name))
+                pass
+            except Exception as e:
+                api.logging.error('error while gathering game_id data for summoner {0}'.format(summoner_name))
+                api.logging.error(str(e))
+
+
+        except Exception as e:
+            api.logging.error('error while gathering summoner data for summoner {0}'.format(summoner_name))
+            api.logging.error(str(e))
+            pass
+
+    def update_static_data(self) -> None:
+        self._update_challenger_leaderboard()
+        print('leaderboards have been created')
+        self._update_champions()
+        print('champions have been created')
+        self._update_queue_types()
+        print('queues have been updated')
+
+    def _update_challenger_leaderboard(self) -> None:
+        solo = self.api.get_leaderboard(api.QueueType.RANKED_SOLO)
+        solo.to_sql(name='leaderboard_solo', con=self.engine, if_exists='replace')
+
+        flex = self.api.get_leaderboard(api.QueueType.RANKED_FLEX)
+        flex.to_sql(name='leaderboard_flex', con=self.engine, if_exists='replace')
+
+    def _update_champions(self) -> None:
+        champions = self.api.get_champion_json()
+        champions.to_sql(name='champions', con=self.engine, if_exists='replace')
+    
+    def _update_queue_types(self) -> None:
+        queues = self.api.get_queue_types()
+        queues.to_sql(name='queues', con=self.engine, if_exists='replace')

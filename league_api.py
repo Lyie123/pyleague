@@ -1,5 +1,6 @@
 import requests
 import pandas as pd
+from datetime import datetime
 import re
 # import unicodedata
 import json
@@ -13,62 +14,11 @@ from sqlalchemy.types import VARCHAR
 from sqlalchemy.orm.exc import NoResultFound
 from enum import Enum
 
-logging.basicConfig(filename='league_api.log', level=logging.DEBUG, format='%(asctime)s %(message)s', datefmt='%d.%m.%Y %H:%M:%S')
+logging.basicConfig(filename='league_api.log', level=logging.INFO, format='%(asctime)s %(message)s', datefmt='%d.%m.%Y %H:%M:%S')
 
 class QueueType(Enum):
     RANKED_SOLO = 'RANKED_SOLO_5x5'
     RANKED_FLEX = 'RANKED_FLEX_SR'
-
-class SqlEngine:
-    def __init__(self, connection_string: str) -> None:
-        self.engine = create_engine(connection_string)
-
-    def create_table(self, table_name: str, table: pd.DataFrame) -> None:
-        """
-        Erstellt eine neue Tabelle.
-        Wenn Tabelle bereits existiert, wird sie ersetzt.
-        Index wird als Primary Key benutzt.
-
-        Arguments:
-            table_name {str} -- Name der Tabelle die erstellt werden soll
-            table {pd.DataFrame} -- Tabelle die erstellt werden soll
-        """
-
-        table.to_sql(table_name, con=self.engine, if_exists='replace', method='multi', dtype={c: VARCHAR(100) for c in table.select_dtypes(include='object').index.names})
-        sql = 'ALTER TABLE ' + table_name + ' ADD PRIMARY KEY(' + ', '.join(table.index.names) + ')'
-        self.engine.execute(text(sql))
-
-    def merge_table(self, table_name: str, table: pd.DataFrame) -> None:
-        if table.shape[0] == 0:
-            return
-
-        table_exists = self.engine.has_table(table_name)
-        if not table_exists:
-            self.create_table(table_name, table)
-        else:
-            try:
-                table.to_sql(table_name, con=self.engine, if_exists='append', dtype={c: VARCHAR(100) for c in table.select_dtypes(include='object').index.names})
-            except exc.IntegrityError as ex:
-                if ex.orig.pgcode == '23505':
-                    pass
-                else:
-                    raise ex
-
-    def table_exists(self, table_name: str) -> bool:
-        return self.engine.has_table(table_name)
-
-    def update_table(self, table_name: str, table: pd.DataFrame) -> None:
-        try:
-            sql = 'update ' + table_name + ' set ' + ' and '.join(table.columns + ' = ' + ['\''+str(e)+'\'' for e in table.iloc[0].values]) + ' where ' + ' and '.join(table.index.name + ' = ' + ['\''+str(e)+'\'' for e in table.index.values])
-            self.engine.execute(text(sql))
-        except Exception:
-            self.merge_table(table_name, table)
-
-    def execute(self, query: str):
-        return self.engine.execute(query)
-
-    def read_table(self, table_name: str):
-        return pd.read_sql_table(table_name, self.engine)
 
 class RiotApi:
     def __init__(self, api_key: str) -> None:
@@ -78,14 +28,17 @@ class RiotApi:
             'X-Riot-Token': self.key
         }
         self.query_delay_time = 100
+        self.version = '10.23.1'
 
     def __snake_case(self, camel_case: str) -> str:
         return re.sub(r'(?<!^)(?=[A-Z])', '_', camel_case).lower()
 
-    def __post_query(self, query: str) -> dict:
-        sleep(0.2)
+    def __post_query(self, query: str, is_first_run: bool=True) -> dict:
+        sleep(0.5)
         r = requests.get(query, headers=self.header)
-        if r.status_code == 403:
+        if r.status_code == 200:
+            return r.json()
+        elif r.status_code == 403:
             logging.error('Forbidden request. Api key is not valid.')
             raise Exception('Forbidden request. Api key is not valid.')
         elif r.status_code == 504:
@@ -99,18 +52,18 @@ class RiotApi:
         elif r.status_code == 404:
             # no data found
             raise NoResultFound('No results from request.')
-        elif r.status_code == 429:
+        elif r.status_code == 429 and is_first_run:
             logging.warning('Rate limit exceeded. Sleep 121 seconds.')
             sleep(121)
             try:
-                r = requests.get(query, headers=self.header)
+                r = requests.get(query, headers=self.header, is_first_run=False)
                 return r.json()
             except Exception:
                 if r.status_code != 200:
                     logging.error('Repeated Error after rate limited exceeded and 120 seconds timeout')
                     raise Exception('Repeated Error after rate limited exceeded and 120 seconds timeout')
         else:
-            return r.json()
+            raise Exception('code {0} error on requesting {1}'.format(r.status_code, query))
 
     def get_summoner_by_name(self, name: str) -> pd.DataFrame:
         result = self.__post_query('https://euw1.api.riotgames.com/lol/summoner/v4/summoners/by-name/'+name)
@@ -121,23 +74,23 @@ class RiotApi:
         df_result['revision_date'] = pd.to_datetime(df_result['revision_date'], unit='ms')
         return df_result
 
-    def get_match_list(self, account_id: str, end_index: int=100, start_index: int=0, queue_id: int=-1, champion_id: int=-1, full: bool=False) -> pd.DataFrame:
-        try:
-            query = 'https://euw1.api.riotgames.com/lol/match/v4/matchlists/by-account/'+account_id+'?beginIndex='+str(start_index)+'&endIndex='+str(end_index)
-            if champion_id != -1:
-                query += '&champion='+str(champion_id)
-            if queue_id != -1:
-                query += '&queue='+str(queue_id)
-            result = self.__post_query(query)['matches']
-            df_matches = pd.json_normalize(result)
-            df_matches.columns = map(self.__snake_case, df_matches.columns)
+    def get_match_list(self, account_id: str, end_index: int=100, start_index: int=0, queue_id: int=-1, champion_id: int=-1, full: bool=False, begin_time: datetime=None) -> pd.DataFrame:
+        query = 'https://euw1.api.riotgames.com/lol/match/v4/matchlists/by-account/'+account_id+'?beginIndex='+str(start_index)+'&endIndex='+str(end_index)
+        if begin_time is not None:
+            stamp = round(begin_time.timestamp()*1000)
+            query += '&beginTime={0}'.format(str(stamp))
+        if champion_id != -1:
+            query += '&champion='+str(champion_id)
+        if queue_id != -1:
+            query += '&queue='+str(queue_id)
+        result = self.__post_query(query)['matches']
+        df_matches = pd.json_normalize(result)
+        df_matches.columns = map(self.__snake_case, df_matches.columns)
 
-            if full and len(df_matches) > 0:
-                df_matches = pd.concat([df_matches, self.get_match_list(account_id, start_index=end_index, end_index=end_index+100, queue_id=queue_id, champion_id=champion_id, full=full)])
+        if full and len(df_matches) > 0:
+            df_matches = pd.concat([df_matches, self.get_match_list(account_id, start_index=end_index, end_index=end_index+100, queue_id=queue_id, champion_id=champion_id, full=full)])
 
-            return df_matches
-        except NoResultFound:
-            return pd.DataFrame()
+        return df_matches
 
     def get_match_details(self, match_id: str) -> Dict[str, pd.DataFrame]:
         result = self.__post_query('https://euw1.api.riotgames.com/lol/match/v4/matches/'+str(match_id))
@@ -169,17 +122,19 @@ class RiotApi:
         df_participants = df_participants.set_index(['game_id', 'timestamp', 'participant_id'])
 
         df_events.columns =  map(self.__snake_case, df_events.columns)
+        df_events.participant_id = df_events.participant_id.fillna('0')
         df_events['game_id'] = str(match_id)
+        df_events['sequence'] = df_events.groupby(['game_id', 'timestamp', 'participant_id', 'type']).cumcount()
         df_events = df_events.set_index(['game_id', 'timestamp', 'participant_id', 'type'])
         
         frames = {}
-        frames.update({'participants': df_participants})
-        frames.update({'events': df_events})
+        frames.update({'timeline_participants': df_participants})
+        frames.update({'timeline_events': df_events})
 
         return frames
 
     def get_leaderboard(self, queue_type: QueueType) -> pd.DataFrame:
-        query = 'https://euw1.api.riotgames.com/lol/league/v4/challengerleagues/by-queue/'+queue_type.value
+        query = 'https://euw1.api.riotgames.com/lol/league/v4/challengerleagues/by-queue/{0}'.format(queue_type.value)
         result = self.__post_query(query)
         result = pd.json_normalize(result, record_path='entries')
         result.columns = map(self.__snake_case, result.columns)
@@ -236,79 +191,14 @@ class RiotApi:
         return df_result
 
     def get_champion_json(self) -> pd.DataFrame:
-        content = requests.get('http://ddragon.leagueoflegends.com/cdn/10.22.1/data/en_US/champion.json').json()
+        content = requests.get('http://ddragon.leagueoflegends.com/cdn/{0}/data/en_US/champion.json'.format(self.version)).json()
         table = pd.DataFrame()
         for value in content['data'].values():
-            table = table.append(pd.json_normalize(value), ignore_index=True)
+            table = table.append(pd.json_normalize(value, sep='_'), ignore_index=True)
         table.columns = map(self.__snake_case, table)
+        table.columns = table.columns.str.replace('stats_', '')
         table.rename(columns={'key': 'champion_id'}, inplace=True)
         table.drop(columns=['id'], inplace=True)
         table.set_index('champion_id', inplace=True)
         table['tags'] = table.tags.apply(lambda x: ', '.join(x))
         return table
-
-
-class Controller:
-    def __init__(self, api_key: str, connection_string: str):
-        self.api = RiotApi(api_key)
-        self.engine = SqlEngine(connection_string)
-
-    def update_summoner(self, summoner_name: str, end_index: int=100, champion_id: int=-1) -> None:
-        """
-        Update Summary profile with specific name.
-        1. fetch summary of summoner by name
-        2. fetch all matches > last update of summoner profile
-        3. merge matches into database
-
-        Arguments:
-            summoner_name {str} -- name of summoner who gets updated
-            end_index {int} -- defines which matches get fetched. Last x matches
-        """
-        logging.debug('Update summoner "{0}"'.format(summoner_name))
-        print('update summoner "{0}"'.format(summoner_name))
-
-        summoner = self.api.get_summoner_by_name(summoner_name)
-        self.engine.merge_table('summoner', summoner)
-
-        matches = self.api.get_match_list(summoner.index[0], end_index=end_index, champion_id=champion_id)
-        amount_of_matches = matches.shape[0]
-
-        # get only new matches
-        stmt = text("select game_id from matches where game_id in :p_matches")
-        stmt = stmt.bindparams(p_matches=tuple([str(x) for x in matches.game_id]))
-        matches_already_loaded = self.engine.execute(stmt)
-        matches_already_loaded = pd.DataFrame(matches_already_loaded.fetchall(), columns=matches_already_loaded.keys())
-        new_matches = matches[~matches.game_id.isin(matches_already_loaded.game_id)]
-
-        logging.debug('%s out of %s fetched matches are not in database', new_matches.shape[0], amount_of_matches)
-        print('{0} out of {1} fetched matches are not in database'.format(new_matches.shape[0], amount_of_matches))
-
-        #update last_update
-        stmt = text("update summoner set last_update = :p_last_update where account_id = :p_acc_id")
-        stmt = stmt.bindparams(p_last_update=pd.Timestamp.now(), p_acc_id=summoner.index[0])
-        self.engine.execute(stmt)
-
-        if amount_of_matches == 0:
-            return
-
-        for m in new_matches.game_id:
-            print('fetch game with id {0}'.format(str(m)))
-            details = self.api.get_match_details(str(m))
-            for name, table in details.items():
-                self.engine.merge_table(name, table)
-            logging.debug('Merge match "{0}" into table'.format(m))
-
-    def update_observed_summoner(self) -> None:
-        stmt = text("select summoner_name from summoner where observed = true")
-        summoner = self.engine.execute(stmt).fetchall()
-        for s in summoner:
-            self.update_summoner(s[0])
-
-    def update_challenger_leaderboard(self) -> None:
-        solo = self.api.get_leaderboard(QueueType.RANKED_SOLO)
-        self.engine.create_table('leaderboard_solo', solo)
-        print('leaderboard_solo was created')
-
-        flex = self.api.get_leaderboard(QueueType.RANKED_FLEX)
-        self.engine.create_table('leaderboard_flex', flex)
-        print('leaderboard_flex was created')
