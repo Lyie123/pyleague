@@ -34,7 +34,7 @@ class RiotApi:
         return re.sub(r'(?<!^)(?=[A-Z])', '_', camel_case).lower()
 
     def __post_query(self, query: str, is_first_run: bool=True) -> dict:
-        sleep(0.5)
+        sleep(0.2)
         r = requests.get(query, headers=self.header)
         if r.status_code == 200:
             return r.json()
@@ -54,7 +54,7 @@ class RiotApi:
             raise NoResultFound('No results from request.')
         elif r.status_code == 429 and is_first_run:
             logging.warning('Rate limit exceeded. Sleep 121 seconds.')
-            sleep(121)
+            sleep(125)
             try:
                 r = requests.get(query, headers=self.header, is_first_run=False)
                 return r.json()
